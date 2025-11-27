@@ -1,0 +1,22 @@
+# Virtual environment
+venv/
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# OS/system files
+.DS_Store
+Thumbs.db
+
+# VS Code workspace settings
+.vscode/
+
+# Logs & cache
+*.log
+*.sqlite3
+*.db
+
+backend/data/jd_cache.json
+backend/data/job_cache.json
