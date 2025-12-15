@@ -1,48 +1,56 @@
 import os
 import json
 import requests
-from backend.utils.pinecone_manager import upsert_job, query_jobs
-from backend.utils.embeddings import get_embedding_model
 
-# Load environment keys
+from backend.utils.embeddings import get_embedding_model
+from backend.utils.pinecone_manager import upsert_job, query_jobs
+from backend.utils.redis_client import redis_client
+
+# =====================================
+# CONFIG
+# =====================================
 RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
 RAPIDAPI_HOST = "jsearch.p.rapidapi.com"
-CACHE_FILE = "backend/data/job_cache.json"
 
 embedding_model = get_embedding_model()
-_job_cache = {}
 
 # =====================================
-# LOAD CACHE FROM DISK
+# REDIS CACHE HELPERS
 # =====================================
-if os.path.exists(CACHE_FILE):
+def _get_cached_jobs(cache_key: str):
     try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            _job_cache = json.load(f)
-            print(f"[cache] Loaded {_job_cache.keys().__len__()} job search entries from disk.")
-    except Exception:
-        _job_cache = {}
-else:
-    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump({}, f)
-
-
-def _save_job_cache():
-    """Persist job cache to local file."""
-    try:
-        with open(CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(_job_cache, f, indent=4, ensure_ascii=False)
+        data = redis_client.get(f"jobs:{cache_key}")
+        return json.loads(data) if data else None
     except Exception as e:
-        print(f"[cache] Save failed: {e}")
+        print(f"[redis] Cache read failed: {e}")
+        return None
+
+
+def _set_cached_jobs(cache_key: str, jobs: list, ttl: int = 60 * 60 * 12):
+    try:
+        redis_client.setex(
+            f"jobs:{cache_key}",
+            ttl,
+            json.dumps(jobs, ensure_ascii=False)
+        )
+    except Exception as e:
+        print(f"[redis] Cache write failed: {e}")
 
 
 # =====================================
 # FETCH JOBS FROM API
 # =====================================
-def fetch_real_jobs(role: str, location: str = "us", pages: int = 1, date_posted: str = "all"):
+def fetch_real_jobs(
+    role: str,
+    location: str = "us",
+    pages: int = 1,
+    date_posted: str = "all"
+):
     """Fetch live jobs using the JSearch API with filters."""
-    print(f"[job_fetch] Fetching jobs for '{role}' in {location} (date={date_posted}, pages={pages})")
+    print(
+        f"[job_fetch] Fetching jobs for '{role}' "
+        f"in {location} (date={date_posted}, pages={pages})"
+    )
 
     url = "https://jsearch.p.rapidapi.com/search"
     headers = {
@@ -60,12 +68,16 @@ def fetch_real_jobs(role: str, location: str = "us", pages: int = 1, date_posted
     try:
         response = requests.get(url, headers=headers, params=params, timeout=20)
         if response.status_code != 200:
-            print(f"[job_fetch] API error {response.status_code}: {response.text[:150]}")
+            print(
+                f"[job_fetch] API error {response.status_code}: "
+                f"{response.text[:150]}"
+            )
             return []
-        data = response.json()
-        jobs = data.get("data", [])
+
+        jobs = response.json().get("data", [])
         print(f"[job_fetch] ✅ Retrieved {len(jobs)} jobs from API.")
         return jobs
+
     except Exception as e:
         print(f"[job_fetch] ❌ Request failed: {e}")
         return []
@@ -74,18 +86,39 @@ def fetch_real_jobs(role: str, location: str = "us", pages: int = 1, date_posted
 # =====================================
 # MAIN PIPELINE
 # =====================================
-def get_best_job_matches(role: str, country="us", remote=False, date_posted="all", pages=1):
-    """Fetch, embed, and return best job matches using Pinecone."""
+def get_best_job_matches(
+    role: str,
+    country: str = "us",
+    remote: bool = False,
+    date_posted: str = "all",
+    pages: int = 1
+):
+    """
+    Fetch, embed, cache (Redis), and return best-matching jobs using Pinecone.
+    """
+
     cache_key = f"{role.lower()}_{country}_{remote}_{date_posted}_{pages}"
 
-    # ✅ Check Cache
-    if cache_key in _job_cache:
-        print(f"[cache] Reusing cached jobs for {cache_key}")
-        return _job_cache[cache_key]
+    # ---------- 1️⃣ CHECK REDIS CACHE ----------
+    cached = _get_cached_jobs(cache_key)
+    if cached:
+        print(f"[redis] Reusing cached jobs for {cache_key}")
+        return cached
 
-    print(f"[job_match_agent] Fetching new jobs for '{role}' in {country} (remote={remote}, date={date_posted})")
-    jobs = fetch_real_jobs(role, location=country, pages=pages, date_posted=date_posted)
+    print(
+        f"[job_match_agent] Fetching new jobs for '{role}' "
+        f"in {country} (remote={remote}, date={date_posted})"
+    )
 
+    # ---------- 2️⃣ FETCH JOBS ----------
+    jobs = fetch_real_jobs(
+        role,
+        location=country,
+        pages=pages,
+        date_posted=date_posted
+    )
+
+    # ---------- 3️⃣ FALLBACK ----------
     if not jobs:
         print("[job_match_agent] ❌ No jobs fetched. Returning fallback job.")
         fallback = [
@@ -97,27 +130,31 @@ def get_best_job_matches(role: str, country="us", remote=False, date_posted="all
                 "score": 0.65
             }
         ]
-        _job_cache[cache_key] = fallback
-        _save_job_cache()
+        _set_cached_jobs(cache_key, fallback)
         return fallback
 
-    # --- Apply remote filter if requested ---
+    # ---------- 4️⃣ REMOTE FILTER ----------
     if remote:
         before = len(jobs)
         jobs = [
             j for j in jobs
-            if "remote" in (j.get("job_title", "").lower() + j.get("job_description", "").lower())
+            if "remote" in (
+                (j.get("job_title", "") + j.get("job_description", "")).lower()
+            )
         ]
-        print(f"[job_match_agent] Filtered remote jobs: {len(jobs)} of {before}")
+        print(
+            f"[job_match_agent] Filtered remote jobs: "
+            f"{len(jobs)} of {before}"
+        )
 
-    # --- Upsert job embeddings into Pinecone ---
+    # ---------- 5️⃣ UPSERT INTO PINECONE ----------
     for job in jobs:
         title = job.get("job_title", "")
         company = job.get("employer_name", "")
         desc = job.get("job_description", "")
         link = job.get("job_apply_link", "")
-        text = f"{title} {desc}".strip()
 
+        text = f"{title} {desc}".strip()
         if not text:
             continue
 
@@ -130,11 +167,12 @@ def get_best_job_matches(role: str, country="us", remote=False, date_posted="all
                 "link": link
             }
             upsert_job(f"{company}_{title}", text, metadata)
+
         except Exception as e:
             print(f"[embedding error] {e}")
             continue
 
-    # --- Query Pinecone for best semantic matches ---
+    # ---------- 6️⃣ QUERY PINECONE ----------
     pinecone_results = query_jobs(role)
 
     results = []
@@ -147,16 +185,19 @@ def get_best_job_matches(role: str, country="us", remote=False, date_posted="all
             "score": round(match["score"], 2)
         })
 
-    # ✅ Save to cache (both memory + file)
-    _job_cache[cache_key] = results
-    _save_job_cache()
-
+    # ---------- 7️⃣ SAVE TO REDIS ----------
+    _set_cached_jobs(cache_key, results)
     print(f"[job_match_agent] ✅ Returning {len(results)} best matches (cached).")
+
     return results
 
+
 def clear_job_cache():
-    """Clear all cached job data."""
-    global _job_cache
-    _job_cache = {}
-    _save_job_cache()
-    print("[cache] Cleared all job search cache.")
+    """Clear ALL job-related Redis cache."""
+    try:
+        keys = redis_client.keys("jobs:*")
+        if keys:
+            redis_client.delete(*keys)
+        print("[redis] Cleared all job search cache.")
+    except Exception as e:
+        print(f"[redis] Cache clear failed: {e}")
