@@ -1,47 +1,29 @@
 import json
-import os
+from backend.utils.redis_client import redis_client
 
-CACHE_FILE = "backend/data_cache.json"
+# ======================
+# JOB DESCRIPTION CACHE
+# ======================
+def get_cached_jd(role: str):
+    return redis_client.get(f"jd:{role.lower()}")
 
-def load_cache():
-    """Load cache from file."""
-    if not os.path.exists(CACHE_FILE):
-        return {"jd_cache": {}, "learning_cache": {}}
-    try:
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"jd_cache": {}, "learning_cache": {}}
+def set_cached_jd(role: str, jd_text: str, ttl=60 * 60 * 24 * 30):
+    redis_client.setex(
+        f"jd:{role.lower()}",
+        ttl,
+        jd_text
+    )
 
+# ======================
+# LEARNING PATH CACHE
+# ======================
+def get_cached_learning(skill: str):
+    data = redis_client.get(f"learning:{skill.lower()}")
+    return json.loads(data) if data else None
 
-def save_cache(cache_data):
-    """Save cache to file."""
-    os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(cache_data, f, indent=4, ensure_ascii=False)
-
-
-def get_cached_jd(role):
-    """Fetch JD if it exists in cache."""
-    cache = load_cache()
-    return cache["jd_cache"].get(role.lower())
-
-
-def set_cached_jd(role, jd_text):
-    """Save JD for a role."""
-    cache = load_cache()
-    cache["jd_cache"][role.lower()] = jd_text
-    save_cache(cache)
-
-
-def get_cached_learning(skill):
-    """Fetch learning path for a skill."""
-    cache = load_cache()
-    return cache["learning_cache"].get(skill.lower())
-
-
-def set_cached_learning(skill, roadmap):
-    """Save learning path for a skill."""
-    cache = load_cache()
-    cache["learning_cache"][skill.lower()] = roadmap
-    save_cache(cache)
+def set_cached_learning(skill: str, roadmap: dict, ttl=60 * 60 * 24 * 60):
+    redis_client.setex(
+        f"learning:{skill.lower()}",
+        ttl,
+        json.dumps(roadmap)
+    )
