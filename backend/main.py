@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import shutil, os
 from backend.chains.resume_analyzer import analyze_resume
 from backend.chains.job_match_agent import get_best_job_matches
+from backend.utils.redis_client import redis_client
 
 app = FastAPI(title="CareerPath – Resume Analyzer API")
 
@@ -20,6 +21,13 @@ app.add_middleware(
 def root():
     return {"message": "🚀 CareerPath API is running. Visit /docs for testing."}
 
+@app.get("/healthz")
+def health_check():
+    try:
+        redis_client.ping()
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "degraded", "error": str(e)}
 
 @app.post("/analyze")
 async def analyze_resume_endpoint(file: UploadFile, target_role: str = Form(...)):
